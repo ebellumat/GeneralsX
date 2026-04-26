@@ -1076,6 +1076,13 @@ void OpenALAudioManager::stopAudioEvent(AudioHandle handle)
 		}
 
 		if (audio->m_audioEventRTS->getPlayingHandle() == handle) {
+			// GeneralsX @bugfix Actually stop the OpenAL source. Setting only
+			// m_requestStop=true left the source playing — and with AL_LOOPING
+			// honoured for permanent ambients, "stop" never took effect and the
+			// loop ran forever (toxin spray, particle cannon, factory ambients).
+			if (audio->m_source) {
+				alSourceStop(audio->m_source);
+			}
 			audio->m_requestStop = true;
 			break;
 		}
@@ -1091,6 +1098,12 @@ void OpenALAudioManager::stopAudioEvent(AudioHandle handle)
 #ifdef INTENSIVE_AUDIO_DEBUG
 			DEBUG_LOG((" (%s)\n", audio->m_audioEventRTS->getEventName()));
 #endif
+			// GeneralsX @bugfix See note above — actually stop the source so
+			// looping ambients/spray/turret-loop sounds end when the game logic
+			// wants them to.
+			if (audio->m_source) {
+				alSourceStop(audio->m_source);
+			}
 			audio->m_requestStop = true;
 			break;
 		}
