@@ -542,7 +542,7 @@ void OpenALAudioManager::stopAudio(AudioAffect which)
 	// All we really need to do is:
 	// 1) Remove the EOS callback.
 	// 2) Stop the sample, (so that when we later unload it, bad stuff doesn't happen)
-	// 3) Set the status to stopped, so that when we next process the playing list, we will 
+	// 3) Set the status to stopped, so that when we next process the playing list, we will
 	//		correctly clean up the sample.
 
 
@@ -2963,12 +2963,17 @@ ALuint OpenALAudioManager::playSample(AudioEventRTS* event, PlayingAudio* audio)
 	if (bufferHandle) {
 		alSourcei(audio->m_source, AL_SOURCE_RELATIVE, AL_TRUE);
 		alSourcei(audio->m_source, AL_BUFFER, (ALuint)(uintptr_t)bufferHandle);
-		// GeneralsX @bugfix Honor the AC_LOOP control bit. Without this, sustained
-		// 2D ambients (UI loops, etc.) end after one play and the dispatcher
-		// re-issues them on the next tick, producing a stuttering re-trigger.
+		// GeneralsX @bugfix Use AL_LOOPING only for *gapless* permanent loops —
+		// sustained water, machine hum, etc. Sounds with m_delayMin/m_delayMax > 0
+		// (bird chirps, distant ambients) are also flagged AC_LOOP+loopCount=0
+		// but the engine wants to space iterations randomly via the dispatcher;
+		// hardware-looping them produces a continuous chirp that ignores the
+		// map's audio scheduling. Finite-loop sounds (AC_LOOP+loopCount>0) also
+		// stay non-looping so the dispatcher re-triggers them N times.
 		const AudioEventInfo* info = event->getAudioEventInfo();
-		const Bool shouldLoop = info && BitIsSet(info->m_control, AC_LOOP);
-		alSourcei(audio->m_source, AL_LOOPING, shouldLoop ? AL_TRUE : AL_FALSE);
+		const Bool gaplessForever = info && info->isPermanentSound()
+		    && info->m_delayMin == 0 && info->m_delayMax == 0;
+		alSourcei(audio->m_source, AL_LOOPING, gaplessForever ? AL_TRUE : AL_FALSE);
 		alSourcePlay(audio->m_source);
 	}
 
@@ -3005,13 +3010,15 @@ ALuint OpenALAudioManager::playSample3D(AudioEventRTS* event, PlayingAudio* samp
 			Real z = pos->z;
 			alSource3f(source, AL_POSITION, x, y, z);
 			alSourcei(source, AL_BUFFER, handle);
-			// GeneralsX @bugfix Same AL_LOOPING fix as 2D samples — water, helicopter
-			// rotors, factory ambients etc. carry AC_LOOP and need AL to loop the
-			// buffer in the source. Without it the dispatcher re-triggers every tick
-			// and we hear a stutter rather than a sustained source.
+			// GeneralsX @bugfix Same gapless-permanent rule as 2D samples — water
+			// surfaces / helicopter rotors / factory ambients use AL_LOOPING for
+			// continuous playback, while bird chirps and other delay-spaced
+			// ambients leave AL_LOOPING off so the engine dispatcher schedules
+			// each iteration with the m_delayMin..m_delayMax random gap.
 			const AudioEventInfo* info = event->getAudioEventInfo();
-			const Bool shouldLoop = info && BitIsSet(info->m_control, AC_LOOP);
-			alSourcei(source, AL_LOOPING, shouldLoop ? AL_TRUE : AL_FALSE);
+			const Bool gaplessForever = info && info->isPermanentSound()
+			    && info->m_delayMin == 0 && info->m_delayMax == 0;
+			alSourcei(source, AL_LOOPING, gaplessForever ? AL_TRUE : AL_FALSE);
 			DEBUG_LOG(("Playing 3D sample '%s' at %f, %f, %f\n", event->getEventName().str(), x, y, z));
 
 			// Start playback
