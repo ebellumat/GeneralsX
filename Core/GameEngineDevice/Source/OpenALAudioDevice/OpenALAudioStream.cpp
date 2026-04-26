@@ -48,9 +48,14 @@ bool OpenALAudioStream::bufferData(uint8_t *data, size_t data_size, ALenum forma
     ALuint &current_buffer = m_buffers[m_current_buffer_idx];
     // GeneralsX @bugfix BenderAI 22/04/2026 Detect and reject invalid OpenAL buffer/queue operations.
     while (alGetError() != AL_NO_ERROR) {}
+
     alBufferData(current_buffer, format, data, data_size, samplerate);
     ALenum err = alGetError();
     if (err != AL_NO_ERROR) {
+        // GeneralsX @bugfix Promote alBufferData failures from DEBUG_LOG (no-op in release)
+        // to stderr so a silent stream is diagnosable in shipping builds.
+        fprintf(stderr, "[audio] alBufferData failed: err=0x%x format=0x%x size=%zu rate=%d\n",
+                (unsigned)err, (unsigned)format, data_size, samplerate);
         DEBUG_LOG(("OpenALAudioStream::bufferData alBufferData failed: err=0x%x format=0x%x size=%zu rate=%d\n",
             (unsigned int)err, (unsigned int)format, data_size, samplerate));
         return false;
@@ -59,6 +64,8 @@ bool OpenALAudioStream::bufferData(uint8_t *data, size_t data_size, ALenum forma
     alSourceQueueBuffers(m_source, 1, &current_buffer);
     err = alGetError();
     if (err != AL_NO_ERROR) {
+        fprintf(stderr, "[audio] alSourceQueueBuffers failed: err=0x%x src=%u buf=%u\n",
+                (unsigned)err, (unsigned)m_source, (unsigned)current_buffer);
         DEBUG_LOG(("OpenALAudioStream::bufferData alSourceQueueBuffers failed: err=0x%x source=%u buffer=%u\n",
             (unsigned int)err, (unsigned int)m_source, (unsigned int)current_buffer));
         return false;
@@ -117,6 +124,20 @@ void OpenALAudioStream::update()
             }
             num_queued = refreshedQueued;
         }
+    }
+
+    // GeneralsX @bugfix Music / streamed-voice cold-start race: playStream() calls
+    // alSourcePlay() before any FFmpeg packet has been decoded, so the source goes
+    // AL_PLAYING -> AL_STOPPED instantly with zero buffers. The early restart at the
+    // top of update() only kicks in when buffers are already queued. After the
+    // refill loop above produces the first buffers, we still need to call play()
+    // — otherwise the manager's stream loop sees AL_STOPPED and tears the stream
+    // down before it ever played a single sample. Symptom: music never plays,
+    // streamed voice lines silent.
+    alGetSourcei(m_source, AL_SOURCE_STATE, &sourceState);
+    alGetSourcei(m_source, AL_BUFFERS_QUEUED, &num_queued);
+    if (num_queued > 0 && (sourceState == AL_STOPPED || sourceState == AL_INITIAL)) {
+        play();
     }
 }
 

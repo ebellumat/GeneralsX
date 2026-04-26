@@ -769,6 +769,11 @@ void OpenALAudioManager::playAudioEvent(AudioEventRTS* event)
 
 		File* file = TheFileSystem->openFile(fileToPlay.str());
 		if (!file) {
+			// GeneralsX @bugfix Stream-open failures used to vanish in release builds because the
+			// only signal was DEBUG_LOG (no-op without RTS_DEBUG). When a music or speech file is
+			// missing from the BIG archive or local FS the user previously got silence with no
+			// way to tell why; surface it on stderr so it shows up in run.sh logs.
+			fprintf(stderr, "[audio] stream openFile failed: '%s'\n", fileToPlay.str());
 			DEBUG_LOG(("Failed to open file: %s\n", fileToPlay.str()));
 			releasePlayingAudio(audio);
 			return;
@@ -777,6 +782,7 @@ void OpenALAudioManager::playAudioEvent(AudioEventRTS* event)
 		FFmpegFile* ffmpegFile = NEW FFmpegFile();
 		if (!ffmpegFile->open(file))
 		{
+			fprintf(stderr, "[audio] FFmpeg open failed: '%s' (codec/container unsupported)\n", fileToPlay.str());
 			DEBUG_LOG(("Failed to open FFmpeg file: %s\n", fileToPlay.str()));
 			releasePlayingAudio(audio);
 			return;
@@ -798,33 +804,59 @@ void OpenALAudioManager::playAudioEvent(AudioEventRTS* event)
 
 				DEBUG_LOG(("Received audio frame\n"));
 
-				AVSampleFormat sampleFmt = static_cast<AVSampleFormat>(frame->format);
-				const int bytesPerSample = av_get_bytes_per_sample(sampleFmt);
-				ALenum format = OpenALAudioManager::getALFormat(frame->ch_layout.nb_channels, bytesPerSample * 8);
-				const int frameSize =
-					av_samples_get_buffer_size(NULL, frame->ch_layout.nb_channels, frame->nb_samples, sampleFmt, 1);
-				uint8_t* frameData = frame->data[0];
+				const AVSampleFormat sampleFmt = static_cast<AVSampleFormat>(frame->format);
 
-				// We need to interleave the samples if the format is planar
-				if (av_sample_fmt_is_planar(static_cast<AVSampleFormat>(frame->format))) {
-					uint8_t* audioBuffer = static_cast<uint8_t*>(av_malloc(frameSize));
+				// GeneralsX @bugfix Convert decoded audio to interleaved 16-bit PCM no
+				// matter what FFmpeg gave us. The original code passed FLT/FLTP through
+				// to OpenAL as AL_FORMAT_*_FLOAT32, which depends on the AL_EXT_FLOAT32
+				// extension and is silently flaky on a few backends (notably OpenAL
+				// Soft 1.24's CoreAudio path on macOS — alBufferData succeeds but the
+				// mixer plays silence). AL_FORMAT_*16 is universally supported.
+				const int channels = frame->ch_layout.nb_channels;
+				const int s16BufferSize = frame->nb_samples * channels * 2;
+				int16_t* s16Buffer = static_cast<int16_t*>(av_malloc(s16BufferSize));
+				const Bool planar = av_sample_fmt_is_planar(sampleFmt);
 
-					// Write the samples into our audio buffer
-					for (int sample_idx = 0; sample_idx < frame->nb_samples; sample_idx++)
-					{
-						int byte_offset = sample_idx * bytesPerSample;
-						for (int channel_idx = 0; channel_idx < frame->ch_layout.nb_channels; channel_idx++)
-						{
-							uint8_t* dst = &audioBuffer[byte_offset * frame->ch_layout.nb_channels + channel_idx * bytesPerSample];
-							uint8_t* src = &frame->data[channel_idx][byte_offset];
-							memcpy(dst, src, bytesPerSample);
-						}
+				auto satFloatToS16 = [](float f) -> int16_t {
+					float v = f * 32767.0f;
+					if (v > 32767.0f) v = 32767.0f;
+					if (v < -32768.0f) v = -32768.0f;
+					return static_cast<int16_t>(v);
+				};
+
+				if (sampleFmt == AV_SAMPLE_FMT_FLTP || sampleFmt == AV_SAMPLE_FMT_FLT) {
+					if (planar) {
+						for (int s = 0; s < frame->nb_samples; ++s)
+							for (int c = 0; c < channels; ++c)
+								s16Buffer[s * channels + c] = satFloatToS16(reinterpret_cast<float*>(frame->data[c])[s]);
+					} else {
+						const float* src = reinterpret_cast<const float*>(frame->data[0]);
+						for (int i = 0; i < frame->nb_samples * channels; ++i)
+							s16Buffer[i] = satFloatToS16(src[i]);
 					}
-					stream->bufferData(audioBuffer, frameSize, format, frame->sample_rate);
-					av_freep(&audioBuffer);
+				} else if (sampleFmt == AV_SAMPLE_FMT_S16P) {
+					for (int s = 0; s < frame->nb_samples; ++s)
+						for (int c = 0; c < channels; ++c)
+							s16Buffer[s * channels + c] = reinterpret_cast<int16_t*>(frame->data[c])[s];
+				} else if (sampleFmt == AV_SAMPLE_FMT_S16) {
+					memcpy(s16Buffer, frame->data[0], s16BufferSize);
+				} else if (sampleFmt == AV_SAMPLE_FMT_S32P || sampleFmt == AV_SAMPLE_FMT_S32) {
+					const Bool sPlanar = (sampleFmt == AV_SAMPLE_FMT_S32P);
+					for (int s = 0; s < frame->nb_samples; ++s)
+						for (int c = 0; c < channels; ++c) {
+							int32_t v = sPlanar
+								? reinterpret_cast<int32_t*>(frame->data[c])[s]
+								: reinterpret_cast<int32_t*>(frame->data[0])[s * channels + c];
+							s16Buffer[s * channels + c] = static_cast<int16_t>(v >> 16);
+						}
+				} else {
+					// Fallback: zero buffer (shouldn't happen with sane FFmpeg builds).
+					memset(s16Buffer, 0, s16BufferSize);
 				}
-				else
-					stream->bufferData(frameData, frameSize, format, frame->sample_rate);
+
+				const ALenum s16Format = OpenALAudioManager::getALFormat(channels, 16);
+				stream->bufferData(reinterpret_cast<uint8_t*>(s16Buffer), s16BufferSize, s16Format, frame->sample_rate);
+				av_freep(&s16Buffer);
 			});
 		}
 		else {
@@ -2902,15 +2934,25 @@ Bool OpenALAudioManager::startNextLoop(PlayingAudio* looping)
 //-------------------------------------------------------------------------------------------------
 void OpenALAudioManager::playStream(AudioEventRTS* event, OpenALAudioStream* stream)
 {
-	// Force it to the beginning
-	if (event->getAudioEventInfo()->m_soundType == AT_Music) {
-		//alSourcei(stream->getSource(), AL_LOOPING, AL_TRUE);
-	}
+	const AudioEventInfo* info = event->getAudioEventInfo();
+
+	// GeneralsX @bugfix The previous code called alSourcePlay() with zero buffers
+	// queued (FFmpeg had not been pumped yet), so the source went AL_PLAYING ->
+	// AL_STOPPED instantly. The manager's stream loop then saw it stopped on the
+	// next tick and tore it down before update() could refill it. Result: music
+	// and streamed voice lines never played. Apply the correct gain and prime the
+	// stream by asking the require-data callback (which decodes one FFmpeg packet
+	// and queues the resulting frames) before alSourcePlay.
+	Real curVolume = (info && info->m_soundType == AT_Music) ? m_musicVolume : m_speechVolume;
+	curVolume *= event->getVolume();
+	stream->setVolume(curVolume);
+
+	// Drain a few FFmpeg packets up front so initial buffers are in the source's
+	// queue before alSourcePlay sees it. The stream's own update() will keep it
+	// topped up afterwards.
+	stream->update();
 
 	stream->play();
-	if (event->getAudioEventInfo()->m_soundType == AT_Music) {
-		// Need to stop/fade out the old music here.
-	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -2921,6 +2963,12 @@ ALuint OpenALAudioManager::playSample(AudioEventRTS* event, PlayingAudio* audio)
 	if (bufferHandle) {
 		alSourcei(audio->m_source, AL_SOURCE_RELATIVE, AL_TRUE);
 		alSourcei(audio->m_source, AL_BUFFER, (ALuint)(uintptr_t)bufferHandle);
+		// GeneralsX @bugfix Honor the AC_LOOP control bit. Without this, sustained
+		// 2D ambients (UI loops, etc.) end after one play and the dispatcher
+		// re-issues them on the next tick, producing a stuttering re-trigger.
+		const AudioEventInfo* info = event->getAudioEventInfo();
+		const Bool shouldLoop = info && BitIsSet(info->m_control, AC_LOOP);
+		alSourcei(audio->m_source, AL_LOOPING, shouldLoop ? AL_TRUE : AL_FALSE);
 		alSourcePlay(audio->m_source);
 	}
 
@@ -2957,6 +3005,13 @@ ALuint OpenALAudioManager::playSample3D(AudioEventRTS* event, PlayingAudio* samp
 			Real z = pos->z;
 			alSource3f(source, AL_POSITION, x, y, z);
 			alSourcei(source, AL_BUFFER, handle);
+			// GeneralsX @bugfix Same AL_LOOPING fix as 2D samples — water, helicopter
+			// rotors, factory ambients etc. carry AC_LOOP and need AL to loop the
+			// buffer in the source. Without it the dispatcher re-triggers every tick
+			// and we hear a stutter rather than a sustained source.
+			const AudioEventInfo* info = event->getAudioEventInfo();
+			const Bool shouldLoop = info && BitIsSet(info->m_control, AC_LOOP);
+			alSourcei(source, AL_LOOPING, shouldLoop ? AL_TRUE : AL_FALSE);
 			DEBUG_LOG(("Playing 3D sample '%s' at %f, %f, %f\n", event->getEventName().str(), x, y, z));
 
 			// Start playback
